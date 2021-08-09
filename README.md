@@ -1,4 +1,6 @@
 Read me for pandem_pollution
+Alex Borowicz
+9 August 2021
 
 In this project I walk through an approach to looking at the question of whether the COVID shutdown in New York City had a measurable effect on air quality. In particular, I'll look at 3 common pollutants - Carbon monoxide, Nitrogen dioxide, and fine particulate matter (PM 2.5) as recorded by EPA air quality monitoring stations.
 
