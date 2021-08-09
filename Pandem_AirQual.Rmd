@@ -1,0 +1,919 @@
+---
+title: "Pandemic Pollution - Alex Borowicz"
+author: "A. Borowicz"
+date: "5/13/2021"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this example, I'm going to walk through an approach to looking at the question of whether the COVID shutdown in New York City had a measurable effect on air quality. In particular, I'll look at 3 common pollutants - Carbon monoxide, Nitrogen dioxide, and fine particulate matter (PM 2.5) as recorded by EPA air quality monitoring stations.
+
+First we'll do some setup. Here I'll load packages to help with data munging, visualization, and analysis.
+
+```{r packages, results='hide', message=FALSE, warning=FALSE}
+
+# For reproducibility
+set.seed(88)
+# Load packages - Munging
+library(dplyr)
+library(lubridate)
+# Visualization
+library(ggplot2)
+library(ggjoy)
+library(wesanderson)
+library(cowplot)
+library(tidybayes)
+# Analysis
+library(R2jags)
+library(rstanarm)
+library(modelr)
+```
+
+We'll import the data. EPA provides this in 1-year csv files, so we'll have to combine them. The data are also available via the EPA API but, given the relatively small amount of data we want, in this case it's easiest to just download individual files and combine them.
+
+Here I'll load in the csvs for each pollutant together, to end up with 3 data frames, one for each pollutant. 
+
+```{r EPA data import}
+nyc_pm2_5.dat<-rbind(read.csv("data/NYNJ_PM2_5_EPA_2016.csv"),
+                     read.csv("data/NYNJ_PM2_5_EPA_2017.csv"),
+                     read.csv("data/NYNJ_PM2_5_EPA_2018.csv"),
+                     read.csv("data/NYNJ_PM2_5_EPA_2019.csv"),
+                     read.csv("data/NYNJ_PM2_5_EPA_2020.csv"),
+                     read.csv("data/NYNJ_PM2_5_EPA_2021.csv"))
+
+nyc_CO.dat<-rbind(read.csv("data/NYNJ_CO_EPA_2016.csv"),
+                  read.csv("data/NYNJ_CO_EPA_2017.csv"),
+                  read.csv("data/NYNJ_CO_EPA_2018.csv"),
+                  read.csv("data/NYNJ_CO_EPA_2019.csv"),
+                  read.csv("data/NYNJ_CO_EPA_2020.csv"),
+                  read.csv("data/NYNJ_CO_EPA_2021.csv"))
+
+nyc_NO2.dat<-rbind(read.csv("data/NYNJ_NO2_EPA_2016.csv"),
+                   read.csv("data/NYNJ_NO2_EPA_2017.csv"),
+                   read.csv("data/NYNJ_NO2_EPA_2018.csv"),
+                   read.csv("data/NYNJ_NO2_EPA_2019.csv"),
+                   read.csv("data/NYNJ_NO2_EPA_2020.csv"),
+                   read.csv("data/NYNJ_NO2_EPA_2021.csv"))
+names(nyc_pm2_5.dat)
+names(nyc_CO.dat)
+names(nyc_NO2.dat)
+```
+## Data Munging
+
+The files are pollutant-specific, but fortunately nearly all the column names are the same - the only difference is the name of the measurement. They're all some form of concentration, and the precise units are unimportant to us here. So we can simply relabel them each as "Concentration." In this way, our columns are shared across the datasets, and we can fuse them. 
+There are a few other tasks to accomplish. We'll want some easier variables to work with than the full date, like the year and month, so we'll create those here. We'll also create a column called "Pandemic" which is a factor that describes whether the measurement was taken pre-pandemic (Normal) or during (Pandemic). We can also jettison the data for areas outside of NYC at this point. These might be interesting, but our particular question relates to NYC.
+```{r Munging}
+# Each data frame has a different column name for the measurement. We'll standardize
+nyc_pm2_5.dat<-nyc_pm2_5.dat %>% 
+  rename(Concentration = Daily.Mean.PM2.5.Concentration)
+nyc_CO.dat<-nyc_CO.dat %>% 
+  rename(Concentration=Daily.Max.8.hour.CO.Concentration)
+nyc_NO2.dat<-nyc_NO2.dat %>% 
+  rename(Concentration=Daily.Max.1.hour.NO2.Concentration)
+
+# now we can put them together
+nyc.dat<-dplyr::bind_rows(nyc_pm2_5.dat, 
+                          nyc_CO.dat, 
+                          nyc_NO2.dat)
+
+# translate date column into date objects
+nyc.dat$Date<-lubridate::mdy(nyc.dat$Date)
+
+# Date munging
+nyc.dat$Year<-lubridate::year(nyc.dat$Date) # Add year column
+nyc.dat$Month<-lubridate::month(nyc.dat$Date) # Add month column
+nyc.dat$Day<-lubridate::yday(nyc.dat$Date) # Add day-of-year column
+# It would be nice to plot everything chronologically, but still have factors as months.
+# We can do this by creating a column that is a numeric representation of months
+nyc.dat$RunningMonth<-as.numeric(nyc.dat$Year)+as.numeric(nyc.dat$Month)/13 
+# Then we make a more readable format
+nyc.dat$RunningtextMonth<-paste(month(nyc.dat$Date, label = TRUE), nyc.dat$Year)
+# And use the numeric format to re-order the readable format so we can plot with it
+nyc.dat$RunningtextMonth<-reorder(nyc.dat$RunningtextMonth, nyc.dat$RunningMonth) 
+# Add a column to delimit the start of Covid in NYC 
+nyc.dat$Pandemic<-sapply(nyc.dat$RunningMonth, 
+                         FUN=function(x) ifelse(x < 2020.3, 
+                                                "Normal",
+                                                "Pandemic")) 
+
+# We'll make a little vector of the pollutant names to help us along
+pol_types<-unique(nyc.dat$AQS_PARAMETER_DESC)
+
+# The data are for the wider NYC area including NJ and Long Island
+# We'll pull only the relevant counties
+
+nyc.dat<-dplyr::filter(nyc.dat, COUNTY %in% c("Kings", 
+                                              "Queens", 
+                                              "Bronx", 
+                                              "New York", 
+                                              "Richmond"),
+                       AQS_PARAMETER_DESC %in% pol_types[c(1,3:4)])
+
+
+```
+
+## Preliminary Visualization
+
+We can visualize the data with a simple scatterplot over time to see how concentration changes.
+We'll set colors based on borough/county in NYC.
+But it turns out that this is misleading, since a dip in 2020 is actually due to a lack of readings for some pollutants.
+
+```{r preliminary plot}
+ggplot(data=nyc.dat[nyc.dat$Year > 2017 & 
+                    nyc.dat$AQS_PARAMETER_DESC == "PM2.5 - Local Conditions",], 
+                  aes(x=Day, 
+                      y=Concentration))+
+  geom_jitter(aes(color=COUNTY), 
+              alpha = 0.2, 
+              height = 0.03)+
+  theme_minimal()+
+  labs(x = "Day of the Year")+
+  ggtitle("PM 2.5")+
+  facet_wrap(~Year)
+
+```
+
+## Joy Plots
+
+Joy plots can help us understand the change over time, visualized in a really rich plot that looks like a ridgeline. I'll make a joy plot for each pollutant and we can look at them together over time.
+
+```{r Joy Plots, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+
+# PM 2.5 Plot
+joy.pm25<-ggplot(nyc.dat[nyc.dat$AQS_PARAMETER_DESC == pol_types[1],], 
+                 aes(x = Concentration, 
+                     y = factor(RunningtextMonth)))+ 
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = "")+
+  lims(x = c(-5,25))+
+  ggtitle("PM 2.5")+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1,2)])+
+  scale_y_discrete(breaks = levels(nyc.dat$RunningtextMonth)[c(T,F)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.title.y = element_blank())
+
+# Carbon monoxide plot
+joy.CO<-ggplot(nyc.dat[nyc.dat$AQS_PARAMETER_DESC == pol_types[3],], 
+               aes(x = Concentration, 
+                   y = factor(RunningtextMonth)))+
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = "Concentration", y = "")+
+  lims(x = c(0,1))+
+  ggtitle(pol_types[3])+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1,2)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# Nitrogen dioxide plot
+joy.NO2<-ggplot(nyc.dat[nyc.dat$AQS_PARAMETER_DESC == pol_types[4],], 
+                aes(x = Concentration, 
+                    y = factor(RunningtextMonth)))+
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = "", y = "")+
+  lims(x = c(-5,75))+
+  ggtitle("Nitrogen dioxide")+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual( values = wes_palette("Zissou1")[c(1,2)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.title.y = element_blank(),
+        axis.text.y  = element_blank())
+
+# Combine plots
+cowplot::plot_grid(joy.pm25, 
+                   joy.CO, 
+                   joy.NO2, 
+                   ncol = 3, 
+                   rel_widths = c(0.38,0.31,0.31))
+
+```
+
+At first glance, we can pick out some interesting insights from our joy plots.
+
+Every summer we see an increase in PM 2.5 between July and August, a pattern that is not really mirrored in Carbon monoxide. There are a few possible explanations here, but one contributor might be fireworks. This seems especially reasonable given the large increase in summer 2020, when many industries were operating at lower capacity, but when fireworks were rampant in the city. In general however, it seems that there has been a slight easing of fine particulate pollution over the course of the pandemic. (Here the pandemic is colored with a lighter blue).
+
+Nitrogen dioxide, which is a product of fossil fuel emissions, has been relatively steady over time, with a fairly predictable meander upwards each spring, potentially due to warming temperatures and atmospheric effects.
+
+Of interest to our question here, of how the shutdown of the city has affected air quality, is the hard decline of Carbon monoxide in the early months of the pandemic. In April through September, CO levels appear to have been at some of their lowest concentrations in the last 5 years. 
+
+To gain an overall sense of the change, we can use the EPA's Air Quality Index statistic in another joy plot:
+
+```{r Air Quality Index joy plot, message=FALSE, warning=FALSE, fig.width=3.5, fig.height=7}
+
+ggplot(data = nyc.dat, 
+       aes(x = DAILY_AQI_VALUE, 
+           y = RunningtextMonth))+
+  geom_joy(scale = 4, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  lims(x = c(-10, 90))+
+  labs(x = "Air Quality Index")+
+  theme_minimal()+
+  theme(axis.title.y = element_blank(),
+        legend.position = "None")+
+  ggtitle("EPA Air Quality - NYC")+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual( values = wes_palette("Zissou1")[c(1,2)])+
+  scale_y_discrete(breaks = levels(nyc.dat$RunningtextMonth)[c(T,F)])
+
+```
+
+The AQI, calculated by the EPA, is not an ideal statistic to be visualized this way, since it operates on a discrete scale. In our joy plot, you can see the bump at low levels get smoothed.
+
+
+```{r AQI plots, warning=FALSE, message=FALSE}
+
+ggplot(data = nyc.dat, 
+       aes(x = Date, 
+           y = DAILY_AQI_VALUE))+
+  geom_jitter(aes(color = Pandemic), 
+              height = 0.25, 
+              alpha = 0.2)+
+  theme_minimal()+
+  labs(y = "Daily Air Quality Index")
+
+```
+
+When we just plot out the AQI as a scatterplot, we see a big dip right at the beginning of the "Pause" in NYC. But it's not clear if this is driven by actual changes in air quality, or missing data. 
+
+```{r AQI Borough plots, warning=FALSE, message=FALSE}
+
+ggplot(data = nyc.dat[nyc.dat$Year > 2018,], 
+              aes(x = Date, 
+                  y = DAILY_AQI_VALUE))+
+  geom_jitter(aes(color = Pandemic), 
+              height = 0.25, 
+              alpha = 0.2)+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle=35, hjust = 1))+
+  labs(y = "Daily Air Quality Index", 
+       x = "")+
+  facet_wrap(~COUNTY)
+
+```
+
+When we compare boroughs side-by-side for 2019 and 2020, we can see where the data are sparse, and where they remain good. Manhattan for example (New York County) seems less dense. But is that just because the air quality dramatically improved as office workers stayed home, and thus all the points are clustered at the bottom? 
+
+```{r data volume stackplot, warning=FALSE, message=FALSE}
+ggplot(data=nyc.dat[nyc.dat$Year == 2020,], 
+       aes(month(Month, label = T)))+
+  geom_bar(aes(fill = COUNTY))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45))+
+  ggtitle("2020")+
+  labs(x = "Month", 
+       y = "No. of Measurements")+
+  scale_fill_manual(values = wes_palette("Darjeeling1", 
+                                       type = "discrete")[c(2,3,1,4,5)])+
+  facet_wrap(~AQS_PARAMETER_DESC)
+
+```
+
+Broken down a little more explicitly, we see that there are no measurements of Nitrogen dioxide anywhere but the Bronx and Queens in 2020. For local PM 2.5, at the beginning of the shutdown, no measurements come from Staten Island (Richmond), Manhattan (New York), or Brooklyn (Kings), though all return by August. For CO, no measurements come from Staten Island and Brooklyn, but other boroughs have consistent measurements. 
+
+So if our interest is in understanding pandemic-related changes in air quality, we should stick to those boroughs with consistent data. The Bronx and Queens are both reliable here throughout, and Manhattan can help us understand Carbon monoxide as well.
+
+## Modelling air quality during Covid
+
+Given the degree of change in behavior of residents in late March through early May, it seems simplest to focus on that period to ask our most basic question of whether the pandemic had a meaningful effect on these pollutants.
+
+So we'll start by working up a simple linear model, implemented here in a Bayesian framework with Stan, comparing the concentration of pollutants over the course of 2019 through mid-2020.
+
+```{r Stan linear models and plots, warning=FALSE, message=FALSE, results='hide'}
+
+# Build out our linear model for each pollutant
+CO_lm.stan<-stan_lm(data = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "New York",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Carbon monoxide", 
+                   RunningMonth > 2019, 
+                   RunningMonth < 2020.7), 
+                   Concentration~Date, 
+                   prior = R2(0.5, 'mean'))
+NO2_lm.stan<-stan_lm(data = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Nitrogen dioxide (NO2)", 
+                   RunningMonth > 2019, 
+                   RunningMonth < 2020.7), 
+                   Concentration~Date, 
+                   prior = R2(0.5, 'mean'))
+PM2_5_lm.stan<-stan_lm(data = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                   RunningMonth > 2019, 
+                   RunningMonth < 2020.7), 
+                   Concentration~Date, 
+                   prior = R2(0.5, 'mean'))
+```
+```{r Stan lm plots, warning=FALSE, error=FALSE, message=FALSE, fig.width=7.5}
+
+# Plot posterior draws and credible intervals on the data
+CO_lm.plot<-filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "New York",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Carbon monoxide", 
+                   RunningMonth > 2019, 
+                   RunningMonth < 2020.7) %>%
+  data_grid(Date = seq_range(Date, n = 10), 
+            Concentration = seq_range(Concentration,by = 0.1)) %>%
+  add_fitted_draws(CO_lm.stan, 
+                   n = 100) %>%
+  ggplot(aes(x = Date, y = Concentration))+
+    geom_jitter(data = filter(nyc.dat, 
+                     COUNTY %in% c("Bronx", 
+                                   "New York",
+                                   "Queens"), 
+                     AQS_PARAMETER_DESC %in% "Carbon monoxide", 
+                     Year > 2018, 
+                     RunningMonth < 2020.7), 
+               alpha = 0.4,
+               height = 0.1, 
+               aes(color = COUNTY))+
+    stat_lineribbon(aes(y = .value), 
+                    .width = c(0.8, 0.95),
+                    alpha = 0.5)+
+    theme_minimal()+
+    theme(axis.text.x = element_text(angle = 45))+
+    ggtitle("Carbon monoxide")+
+    scale_fill_manual(values = wes_palette("GrandBudapest2")[c(2,4)],
+                      name = "Credible Interval", 
+                      labels = c("95%", "80%"))+
+    labs(x = "", 
+         y = "")+
+    scale_color_manual(name = "County",
+                       values = wes_palette("FantasticFox1")[c(1:3,5)])
+
+NO2_lm.plot<-filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Nitrogen dioxide (NO2)", 
+                   RunningMonth > 2019, 
+                   RunningMonth < 2020.7) %>%
+  data_grid(Date = seq_range(Date, n = 10), 
+            Concentration = seq_range(Concentration,
+                                    by = 0.1)) %>%
+  add_fitted_draws(NO2_lm.stan, 
+                   n = 100) %>%
+  ggplot(aes(x = Date, 
+             y = Concentration))+
+    geom_jitter(data = filter(nyc.dat, 
+                     COUNTY %in% c("Bronx", 
+                                   "Queens"), 
+                     AQS_PARAMETER_DESC %in% "Nitrogen dioxide (NO2)", 
+                     Year > 2018, 
+                     RunningMonth < 2020.7), 
+               alpha = 0.4,
+               height = 0.1, 
+               aes(color = COUNTY))+
+    stat_lineribbon(aes(y = .value), 
+                    .width = c(0.8, 0.95), 
+                    alpha = 0.5)+
+    theme_minimal()+
+    theme(legend.position = "None",
+          axis.text.x = element_text(angle = 45))+
+    ggtitle("Nitrogen dioxide")+
+    scale_fill_manual(values = wes_palette("GrandBudapest2")[c(2,4)],
+                      name = "Credible Interval", 
+                      labels = c("95%", "80%"))+
+    labs(x = " ", 
+         y = "")+
+    scale_color_manual(name = "County",
+                       values = wes_palette("FantasticFox1")[c(1:3,5)])
+
+PM2_5_lm.plot<-filter(nyc.dat, 
+                      COUNTY %in% c("Bronx", 
+                                    "Queens"), 
+                      AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                      RunningMonth > 2019, 
+                      RunningMonth < 2020.7) %>%
+  data_grid(Date = seq_range(Date, n = 10), 
+            Concentration = seq_range(Concentration,
+                                    by = 0.1)) %>%
+  add_fitted_draws(PM2_5_lm.stan, 
+                   n = 100) %>%
+  ggplot(aes(x = Date, 
+             y = Concentration))+
+    geom_jitter(data = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                   Year > 2018, 
+                   RunningMonth < 2020.7), 
+             alpha = 0.4,
+             height = 0.1, 
+             aes(color = COUNTY))+
+    geom_jitter(data = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                   Year > 2018, 
+                   RunningMonth < 2020.7), 
+                alpha = 0.4,
+                height = 0.1, 
+                aes(color = COUNTY))+
+    stat_lineribbon(aes(y = .value), 
+                    .width = c(0.8, 0.95), 
+                    alpha = 0.5)+
+    theme_minimal()+
+    theme(legend.position = "None",
+          axis.text.x = element_text(angle = 45))+
+    scale_fill_manual(values = wes_palette("GrandBudapest2")[c(2,4)],
+                      name = "Credible Interval", 
+                      labels = c("95%", "80%"))+
+    scale_color_manual(name = "County",
+                       values = wes_palette("FantasticFox1")[c(1:3,5)])+
+    labs(x = "", 
+         y = "Concentration")+
+    ggtitle("PM 2.5")
+
+cowplot::plot_grid(PM2_5_lm.plot, 
+                   NO2_lm.plot, 
+                   CO_lm.plot, 
+                   ncol = 3, 
+                   rel_widths = c(1,1,2.1))
+
+```
+
+There isn't much evidence for a decline in PM2.5, but somewhat more compelling evidence for NO2. We can take a closer look at the estimates:
+
+
+```{r N02 summary}
+summary(NO2_lm.stan)
+
+NO2_lm.stan$coefficients
+```
+
+
+Here in the case of our NO2 model, the slightly negative log-fit ratio indicates a good fit. 
+
+But a simple linear model here is not necessarily the best way to look at these data. Just on the side of the data, there is some heteroskedacity that we might be concerned about. But more importantly, a linear model does not match our actual hypothesis, which is that the pandemic shutdown would have a noticeable effect. A linear model would be better at determining whether there had been a steady decline since the beginning of 2019, but that is not our hypothesis. What we really want to test is whether the "intervention" of the pandemic changed air pollutant concentrations. 
+
+To do that, we can look across the various months of April, for example, and see whether April 2020 exceeds the normal variance you'd expect between years.
+
+```{r April violin plots, warning=FALSE, error=FALSE, message=FALSE}
+# Carbon monoxide
+CO_violin.plot<-ggplot(data=nyc.dat[nyc.dat$Month == 4 & 
+                                    nyc.dat$Year < 2021 & 
+                                    nyc.dat$AQS_PARAMETER_DESC == "Carbon monoxide",])+
+  geom_violin(aes(x = factor(Year), 
+                  y = Concentration, 
+                  fill = Pandemic))+
+  geom_jitter(aes(x = factor(Year), 
+                  y = Concentration, 
+                  color = Pandemic), 
+              width = 0.1, 
+              alpha = 0.5)+
+  theme_minimal()+
+  theme(axis.title.y = element_blank(),
+        legend.position = "None")+
+  labs(x = "Carbon monoxide")+
+  ggtitle("")+
+  scale_fill_manual(values = wes_palette("Darjeeling1")[c(5,1)])+
+  scale_color_manual(values = wes_palette("Zissou1")[c(3,4)])
+
+# Nitrogen dioxide
+NO2_violin.plot<-ggplot(data = nyc.dat[nyc.dat$Month == 4 & 
+                    nyc.dat$Year < 2021 & 
+                    nyc.dat$AQS_PARAMETER_DESC == "Nitrogen dioxide (NO2)",])+
+  geom_violin(aes(x = factor(Year), 
+                  y = Concentration, 
+                  fill = Pandemic))+
+  geom_jitter(aes(x = factor(Year), 
+                  y = Concentration, 
+                  color = Pandemic), 
+              width = 0.1, 
+              alpha = 0.5)+
+  theme_minimal()+
+  theme(axis.title.y = element_blank(),
+        legend.position = "None")+
+  labs(x = "Nitrogen dioxide")+
+  ggtitle("")+
+  scale_fill_manual(values = wes_palette("Darjeeling1")[c(5,1)])+
+  scale_color_manual(values = wes_palette("Zissou1")[c(3,4)])
+
+# PM 2.5
+PM2_5_violin.plot<-ggplot(data = nyc.dat[nyc.dat$Month == 4 & 
+                    nyc.dat$Year < 2021 & 
+                    nyc.dat$AQS_PARAMETER_DESC == "PM2.5 - Local Conditions",])+
+  geom_violin(aes(x = factor(Year), 
+                  y = Concentration, 
+                  fill = Pandemic))+
+  geom_jitter(aes(x = factor(Year), 
+                  y = Concentration, 
+                  color = Pandemic), 
+              width = 0.1, 
+              alpha = 0.5)+
+  theme_minimal()+
+  theme(legend.position = "None")+
+  ggtitle("April Concentrations")+
+  labs(x = "PM 2.5")+
+  scale_fill_manual(values = wes_palette("Darjeeling1")[c(5,1)])+
+  scale_color_manual(values = wes_palette("Zissou1")[c(3,4)])
+
+# Plot together
+cowplot::plot_grid(PM2_5_violin.plot, 
+                   NO2_violin.plot, 
+                   CO_violin.plot, 
+                   ncol = 3, 
+                   rel_widths = c(0.33, 0.33, 0.33))
+```
+
+When viewed this way - comparing Aprils in different years, we can see that April 2020 showed some difference, but it's not clear in each case whether that difference is substantially different enough from normal that we can think about attributing causation to it. So to answer the question that we're interested in, we can either do a t-test in a frequentist framework, or a similar approach in a Bayesian framework.
+
+Rather than using Stan here, I'll implement this model in JAGS, which requires more explicit description of the model. JAGS and RMarkdown don't get along when creating models, so the model parameterization file is included separately and called here to evaluate.
+
+```{r April analysis - JAGS, warning=FALSE, message=FALSE, echo=FALSE}
+# Specify the JAGS model
+
+#sink("Pollutants_NYC.jags")
+
+#cat("
+#    model {
+#    for (i in 1:length(CO)) {
+#    CO[i] ~ dnorm(mu_CO[i], tau_CO)
+#    COnew[i] ~ dnorm(mu_CO[i], tau_CO) # To get prediction intervals
+#    mu_CO[i] <- alpha_CO + beta_CO * grp_CO[i]
+#    }
+#    for (i in 1:length(NO2)) {
+#    NO2[i] ~ dnorm(mu_NO2[i], tau_NO2)
+#    NO2new[i] ~ dnorm(mu_NO2[i], tau_NO2) # To get prediction intervals
+#    mu_NO2[i] <- alpha_NO2 + beta_NO2 * grp_NO2[i]
+#    }
+#    for (i in 1:length(PM2_5)) {
+#    PM2_5[i] ~ dnorm(mu_PM2_5[i], tau_PM2_5)
+#    PM2_5new[i] ~ dnorm(mu_PM2_5[i], tau_PM2_5) # To get prediction intervals
+#    mu_PM2_5[i] <- alpha_PM2_5 + beta_PM2_5 * grp_PM2_5[i]
+#    }
+#    
+#    tau_CO <- pow(sigma_CO, -2) #to the -2 power
+#    sigma_CO ~ dgamma(0.001, 0.001)
+#    alpha_CO ~ dnorm(0, 0.001)
+#    beta_CO ~ dnorm(0, 0.001)
+#    tau_NO2 <- pow(sigma_NO2, -2) #to the -2 power
+#    sigma_NO2 ~ dgamma(0.001, 0.001)
+#    alpha_NO2 ~ dnorm(0, 0.001)
+#    beta_NO2 ~ dnorm(0, 0.001)
+#    tau_PM2_5 <- pow(sigma_PM2_5, -2) #to the -2 power
+#    sigma_PM2_5 ~ dgamma(0.001, 0.001)
+#    alpha_PM2_5 ~ dnorm(0, 0.001)
+#    beta_PM2_5 ~ dnorm(0, 0.001)
+  
+    
+#    }",fill = TRUE)
+
+#sink()
+
+# Load data
+Dat <- list(
+  CO = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "New York",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Carbon monoxide", 
+                   Month == 4, 
+                   Year < 2021)$Concentration,
+  NO2 = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Nitrogen dioxide (NO2)", 
+                   Month == 4, 
+                   Year < 2021)$Concentration,
+  PM2_5 = filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                   Month == 4, 
+                   Year < 2021)$Concentration, 
+  grp_CO = factor(filter(nyc.dat, 
+                   COUNTY %in% c("Bronx", 
+                                 "New York",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Carbon monoxide", 
+                   Month == 4, 
+                   Year < 2021)$Pandemic),
+  grp_NO2 = factor(filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "Nitrogen dioxide (NO2)", 
+                   Month == 4, 
+                   Year < 2021)$Pandemic),
+  grp_PM2_5 = factor(filter(nyc.dat, 
+                   COUNTY %in% c("Bronx",
+                                 "Queens"), 
+                   AQS_PARAMETER_DESC %in% "PM2.5 - Local Conditions", 
+                   Month == 4, 
+                   Year < 2021)$Pandemic)
+)
+
+# Specify starting values
+InitStage <- list(
+  list(alpha_CO = rnorm(1,100,10),
+       alpha_NO2 = rnorm(1,100,10),
+       alpha_PM2_5 = rnorm(1,100,10), 
+       beta_CO = rnorm(1,100,10),
+       beta_NO2 = rnorm(1,100,10),
+       beta_PM2_5 = rnorm(1,100,10), 
+       sigma_CO = 1),
+  list(alpha_CO = rnorm(1,100,10),
+       alpha_NO2 = rnorm(1,100,10),
+       alpha_PM2_5 = rnorm(1,100,10), 
+       beta_CO = rnorm(1,100,10),
+       beta_NO2 = rnorm(1,100,10),
+       beta_PM2_5 = rnorm(1,100,10), 
+       sigma_CO = 1),
+  list(alpha_CO = rnorm(1,100,10),
+       alpha_NO2 = rnorm(1,100,10),
+       alpha_PM2_5 = rnorm(1,100,10), 
+       beta_CO = rnorm(1,100,10),
+       beta_NO2 = rnorm(1,100,10),
+       beta_PM2_5 = rnorm(1,100,10), 
+       sigma_CO = 1)
+)
+
+# Note posterior estimates to record
+ParsStage <- c("beta_CO", "beta_NO2", "beta_PM2_5")
+
+# Specify MCMC params
+ni <- 11000  # number of draws from the posterior
+nt <- 1    #thinning rate
+nb <- 1000  # number to discard for burn-in
+nc <- 3  # number of chains
+
+# Run the model
+g = jags(inits = InitStage,
+         n.chains = nc,
+         model.file = "Pollutants_NYC.jags",
+         working.directory = getwd(),
+         data = Dat,
+         parameters.to.save = ParsStage,
+         n.thin = nt,
+         n.iter = ni,
+         n.burnin = nb,
+         DIC = T)
+```
+Now we've run the model, and we can have a look at the posterior estimates. In particular here, we're interested in the estimate for Beta, which is our slope in a linear context. Negative values will tell us that there's a negative relationship (i.e., that April 2020 did go down) and positive values the opposite. 
+
+```{r Plot posteriors, message=FALSE, error=FALSE, warning=FALSE}
+
+# Now we can work with the model output
+
+g_df<-as.data.frame(g$BUGSoutput$sims.matrix)
+
+# First we'll record the credible intervals
+
+b_CI<-data.frame(Pollutant = c("CO","CO","NO2","NO2", "PM2.5", "PM2.5"),
+                 CI = c(quantile(g_df$beta_CO, 0.025),
+                        quantile(g_df$beta_CO, 0.975),
+                        quantile(g_df$beta_NO2, 0.025),
+                        quantile(g_df$beta_NO2, 0.975),
+                        quantile(g_df$beta_PM2_5, 0.025),
+                        quantile(g_df$beta_PM2_5, 0.975)),
+                 Type = c("Lower","Upper","Lower","Upper","Lower","Upper"))
+
+# And then make a new dataframe in which we record all the 
+# posterior estimates that fall within the CIs
+bCIarea<-data.frame(beta_CO = g_df$beta_CO[g_df$beta_CO > b_CI$CI[1] & 
+                                           g_df$beta_CO < b_CI$CI[2]],
+                    beta_NO2 = g_df$beta_NO2[g_df$beta_NO2 > b_CI$CI[3] & 
+                                             g_df$beta_NO2 < b_CI$CI[4]],
+                    beta_PM2_5 = g_df$beta_PM2_5[g_df$beta_PM2_5 > b_CI$CI[5] & 
+                                                 g_df$beta_PM2_5 < b_CI$CI[6]])
+
+# And then we can plot the posterior estimates for our beta parameter
+CO_beta.plot<-ggplot(data = g_df, 
+                     aes(x = beta_CO))+
+  geom_density(fill = wes_palette("GrandBudapest2")[1], 
+               color = wes_palette("GrandBudapest2")[1])+
+  geom_density(data = bCIarea, 
+               fill = wes_palette("GrandBudapest2")[2], 
+               color = wes_palette("GrandBudapest2")[2])+
+  theme_minimal()+
+  theme(axis.title.y = element_blank())+
+  labs(x = "Beta CO")+
+  ggtitle(" ")
+NO2_beta.plot<-ggplot(data = g_df, 
+                      aes(x = beta_NO2))+
+  geom_density(fill = wes_palette("GrandBudapest2")[1], 
+               color = wes_palette("GrandBudapest2")[1])+
+  geom_density(data = bCIarea, 
+               fill = wes_palette("GrandBudapest2")[2], 
+               color = wes_palette("GrandBudapest2")[2])+
+  theme_minimal()+
+  theme(axis.title.y = element_blank())+
+  labs(x = "Beta NO2")+
+  ggtitle(" ")
+PM2_5_beta.plot<-ggplot(data = g_df, 
+                        aes(x = beta_PM2_5))+
+  geom_density(fill = wes_palette("GrandBudapest2")[1], 
+               color = wes_palette("GrandBudapest2")[1])+
+  geom_density(data = bCIarea, 
+               fill = wes_palette("GrandBudapest2")[2], 
+               color = wes_palette("GrandBudapest2")[2])+
+  theme_minimal()+
+  labs(x = "Beta PM 2.5", 
+       y = "Density")+
+  ggtitle("Posterior estimates, Beta")
+
+# Plot together
+cowplot::plot_grid(PM2_5_beta.plot, 
+                   NO2_beta.plot, 
+                   CO_beta.plot, 
+                   ncol = 3, 
+                   rel_widths = c(0.33, 0.33, 0.33))
+# Table for CIs
+knitr::kable(b_CI, caption = "95% Credible Intervals")
+```
+
+Based on our posterior estimates of Beta here, we can see that for PM 2.5, our 95% credible intervals overlap substantially with 0. Areas outside the credible intervals here are pink, while those within are blue. In Bayesian paradigm, this essentially means that there was no significant difference between Aprils prior to Covid and April 2020.
+
+On the other hand, both NO2 and CO show significant drops in concentration for that April. 
+
+So at this point, we've assessed that concentrations were unusually low in April 2020 for two of our pollutants. Our next step, attempting to understand the causes of this drop, requires more particular knowledge of the typical sources of CO and NO2 in the city. A variety of publicly-available data, including data from the City of New York could help here, but the craft of determining plausible explanations is not always served by merely data-mining as many potential covariates as possible. As previously mentioned, fireworks may have played a role in the lack of a drop in PM 2.5, but the specifics of emissions of each pollutant require a better understanding of systems involved.
+
+Without exploring the potential atmospheric science involved here, we can still compare to other large cities to get a sense for the patter at a larger scale.
+
+I've pulled in data from the EPA's monitoring stations in Seattle as well. I'll omit the code as it's the duplicate of what we've done above (but is available in the .RMD), and we can have a look at the comparison with our joy plots again.
+
+
+```{r EPA data import - SEA, echo=FALSE}
+SEA_pm2_5.dat<-rbind(read.csv("data/SEATAC_PM2_5_EPA_2016.csv"),
+                     read.csv("data/SEATAC_PM2_5_EPA_2017.csv"),
+                     read.csv("data/SEATAC_PM2_5_EPA_2018.csv"),
+                     read.csv("data/SEATAC_PM2_5_EPA_2019.csv"),
+                     read.csv("data/SEATAC_PM2_5_EPA_2020.csv"),
+                     read.csv("data/SEATAC_PM2_5_EPA_2021.csv"))
+
+SEA_CO.dat<-rbind(read.csv("data/SEATAC_CO_EPA_2016.csv"),
+                  read.csv("data/SEATAC_CO_EPA_2017.csv"),
+                  read.csv("data/SEATAC_CO_EPA_2018.csv"),
+                  read.csv("data/SEATAC_CO_EPA_2019.csv"),
+                  read.csv("data/SEATAC_CO_EPA_2020.csv"),
+                  read.csv("data/SEATAC_CO_EPA_2021.csv"))
+
+SEA_NO2.dat<-rbind(read.csv("data/SEATAC_NO2_EPA_2016.csv"),
+                   read.csv("data/SEATAC_NO2_EPA_2017.csv"),
+                   read.csv("data/SEATAC_NO2_EPA_2018.csv"),
+                   read.csv("data/SEATAC_NO2_EPA_2019.csv"),
+                   read.csv("data/SEATAC_NO2_EPA_2020.csv"),
+                   read.csv("data/SEATAC_NO2_EPA_2021.csv"))
+```
+
+```{r Munging SEA, echo=FALSE}
+# Each data frame has a different column name for the measurement. We'll standardize
+SEA_pm2_5.dat<-SEA_pm2_5.dat %>% rename(Concentration = Daily.Mean.PM2.5.Concentration)
+SEA_CO.dat<-SEA_CO.dat %>% rename(Concentration = Daily.Max.8.hour.CO.Concentration)
+SEA_NO2.dat<-SEA_NO2.dat %>% rename(Concentration = Daily.Max.1.hour.NO2.Concentration)
+
+# now we can put them together
+SEA.dat<-dplyr::bind_rows(SEA_pm2_5.dat, 
+                          SEA_CO.dat, 
+                          SEA_NO2.dat)
+
+# translate date column into date objects
+SEA.dat$Date<-lubridate::mdy(SEA.dat$Date)
+
+# Date munging
+SEA.dat$Year<-lubridate::year(SEA.dat$Date) # Add year column
+SEA.dat$Month<-lubridate::month(SEA.dat$Date) # Add month column
+SEA.dat$Day<-lubridate::yday(SEA.dat$Date) # Add day-of-year column
+# It would be nice to plot everything chronologically, but still have factors as months.
+# We can do this by creating a column that is a numeric representation of months
+SEA.dat$RunningMonth<-as.numeric(SEA.dat$Year)+as.numeric(SEA.dat$Month)/13 
+# Then we make a more readable format
+SEA.dat$RunningtextMonth<-paste(month(SEA.dat$Date, label = TRUE), SEA.dat$Year)
+# And use the numeric format to re-order the readable format so we can plot with it
+SEA.dat$RunningtextMonth<-reorder(SEA.dat$RunningtextMonth, SEA.dat$RunningMonth) 
+# Add a column to delimit the start of Covid in NYC 
+SEA.dat$Pandemic<-sapply(SEA.dat$RunningMonth, 
+                         FUN=function(x) ifelse(x < 2020.3, 
+                                                "Normal",
+                                                "Pandemic")) 
+
+# We'll take only King County (Seattle) and omit the others for now
+
+SEA.dat<-dplyr::filter(SEA.dat, COUNTY == "King",
+                       AQS_PARAMETER_DESC %in% pol_types[c(1,3:4)])
+
+All_dat<-rbind(nyc.dat, SEA.dat)
+All_dat$loc<-c(rep("NYC",length(nyc.dat[,1])), rep("SEA", length(SEA.dat[,1])))
+All_dat$Pollutant_location<-factor(mapply(FUN=function(x,y) paste(x, y, sep = " "), 
+                                          x = All_dat$AQS_PARAMETER_DESC, 
+                                          y = All_dat$loc))
+
+
+```
+
+
+
+```{r Joy Plots All, warning=FALSE, message=FALSE, fig.width=9, fig.height=7}
+
+# PM 2.5 Plot
+SEA_joy.pm25<-ggplot(SEA.dat[SEA.dat$AQS_PARAMETER_DESC == pol_types[1],], 
+                 aes(x = Concentration, 
+                     y = factor(RunningtextMonth)))+ 
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = "")+
+  lims(x = c(-5,25))+
+  ggtitle("PM 2.5")+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1,2)])+
+  scale_y_discrete(breaks = levels(nyc.dat$RunningtextMonth)[c(T,F)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.title.y = element_blank())
+
+# Carbon monoxide plot
+SEA_joy.CO<-ggplot(SEA.dat[SEA.dat$AQS_PARAMETER_DESC == pol_types[3],], 
+               aes(x = Concentration, 
+                   y = factor(RunningtextMonth)))+
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = " ",
+       y = "")+
+  lims(x = c(0,1))+
+  ggtitle(pol_types[3])+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1,2)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# Nitrogen dioxide plot
+SEA_joy.NO2<-ggplot(SEA.dat[SEA.dat$AQS_PARAMETER_DESC == pol_types[4],], 
+                aes(x = Concentration, 
+                    y = factor(RunningtextMonth)))+
+  geom_joy(scale = 3, 
+           alpha = 0.95,
+           size = 1, 
+           aes(fill = Pandemic,
+               color = Pandemic))+
+  labs(x = "", 
+       y = "")+
+  lims(x = c(-5,75))+
+  ggtitle("Nitrogen dioxide")+
+  scale_color_manual(values = wes_palette("Zissou1")[c(2,1)])+
+  scale_fill_manual( values = wes_palette("Zissou1")[c(1,2)])+
+  theme_minimal()+
+  theme(legend.position = "None",
+        axis.title.y = element_blank(),
+        axis.text.y  = element_blank())
+
+# Combine plots - NYC + SEA
+cowplot::plot_grid(joy.pm25+ggtitle("PM2.5 - NYC"), 
+                   SEA_joy.pm25+ggtitle("SEA")+
+                     theme(axis.text.y = element_blank()),
+                   joy.CO+ggtitle("CO - NYC"),
+                   SEA_joy.CO+ggtitle("SEA"),
+                   joy.NO2+ggtitle("NO2 - NYC"),
+                   SEA_joy.NO2+ggtitle("SEA"),
+                   ncol = 6,
+                   rel_widths = c(1.4,1,1,1,1,1))
+
+
+
+```
+
+At a broad scale, we see similar patterns. A decline in spring that includes some of the lowest readings recorded of PM2.5 and CO. Perhaps more interesting however, and certainly more noticeable now that we're looking across two cities, is the decrease in variance for each pollutant as the pandemic shutdown begins. The Seattle area more than NYC has quite variable readings in each month, with broad distributions, but as shutdown begins (March 23 in Seattle), distribution flattens quite a bit. In the model we produced before, we were primarily interested in the mean value for April in each year, but we could also model the variance as well in a hierarchical modelling framework.
+
+Exploring a dataset such as this means understanding the nature of the data it contains - what does each variable mean?, how are observations collected?, where is there independence or not? However there must always be a stage in which creating a useful model relies on domain expertise and conversations with the relevant experts. In this case I would be wary to go much farther without bringing in an atmospheric scientist and having discussions with those who pay attention to drivers of pollutant concentration.
+
+

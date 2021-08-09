@@ -1,0 +1,33 @@
+
+    model {
+    for (i in 1:length(CO)) {
+    CO[i] ~ dnorm(mu_CO[i], tau_CO)
+    COnew[i] ~ dnorm(mu_CO[i], tau_CO) # To get prediction intervals
+    mu_CO[i] <- alpha_CO + beta_CO * grp_CO[i]
+    }
+    for (i in 1:length(NO2)) {
+    NO2[i] ~ dnorm(mu_NO2[i], tau_NO2)
+    NO2new[i] ~ dnorm(mu_NO2[i], tau_NO2) # To get prediction intervals
+    mu_NO2[i] <- alpha_NO2 + beta_NO2 * grp_NO2[i]
+    }
+    for (i in 1:length(PM2_5)) {
+    PM2_5[i] ~ dnorm(mu_PM2_5[i], tau_PM2_5)
+    PM2_5new[i] ~ dnorm(mu_PM2_5[i], tau_PM2_5) # To get prediction intervals
+    mu_PM2_5[i] <- alpha_PM2_5 + beta_PM2_5 * grp_PM2_5[i]
+    }
+    
+    tau_CO <- pow(sigma_CO, -2) #to the -2 power
+    sigma_CO ~ dgamma(0.001, 0.001)
+    alpha_CO ~ dnorm(0, 0.001)
+    beta_CO ~ dnorm(0, 0.001)
+    tau_NO2 <- pow(sigma_NO2, -2) #to the -2 power
+    sigma_NO2 ~ dgamma(0.001, 0.001)
+    alpha_NO2 ~ dnorm(0, 0.001)
+    beta_NO2 ~ dnorm(0, 0.001)
+    tau_PM2_5 <- pow(sigma_PM2_5, -2) #to the -2 power
+    sigma_PM2_5 ~ dgamma(0.001, 0.001)
+    alpha_PM2_5 ~ dnorm(0, 0.001)
+    beta_PM2_5 ~ dnorm(0, 0.001)
+  
+    
+    }
